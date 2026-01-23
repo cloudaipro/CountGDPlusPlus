@@ -12,4 +12,12 @@
 # Copyright (c) Facebook, Inc. and its affiliates. All Rights Reserved.
 # ------------------------------------------------------------------------
 
-from .groundingdino import build_groundingdino
+__all__ = ["build_groundingdino"]
+
+
+def __getattr__(name: str):
+    if name == "build_groundingdino":
+        from .groundingdino import build_groundingdino
+
+        return build_groundingdino
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
