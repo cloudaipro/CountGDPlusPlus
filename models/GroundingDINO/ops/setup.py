@@ -35,7 +35,10 @@ def get_extensions():
 
 
 
-    if torch.cuda.is_available() and CUDA_HOME is not None:
+    force_cuda = os.getenv("FORCE_CUDA", "0") == "1"
+    use_cuda = (torch.cuda.is_available() or force_cuda) and CUDA_HOME is not None
+
+    if use_cuda:
         extension = CUDAExtension
         sources += source_cuda
         define_macros += [("WITH_CUDA", None)]
@@ -46,7 +49,7 @@ def get_extensions():
             "-D__CUDA_NO_HALF2_OPERATORS__",
         ]
     else:
-        raise NotImplementedError('Cuda is not availabel')
+        raise NotImplementedError("CUDA is not available (set FORCE_CUDA=1 and ensure CUDA_HOME is set).")
 
     sources = [os.path.join(extensions_dir, s) for s in sources]
     include_dirs = [extensions_dir]
