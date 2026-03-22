@@ -365,6 +365,230 @@ class GroundingDINO(nn.Module):
 
         return x
 
+    def compute_backbone_cache(
+        self,
+        input_images: NestedTensor,
+        input_image_pos_exemplars: NestedTensor,
+        pos_exemplars: List,
+        input_images_neg_exemplars: List[NestedTensor],
+        neg_exemplars: List,
+    ):
+        """Compute image-dependent features once at batch_size=1.
+
+        Returns a dict of cached tensors that can be reused across multiple
+        calls to forward_single_with_cache() with different text prompts.
+        """
+        if isinstance(input_images, (list, torch.Tensor)):
+            input_images = nested_tensor_from_tensor_list(input_images)
+
+        features, poss = self.backbone(input_images)
+
+        # Positive exemplars
+        features_pos_exemp, _ = self.backbone(input_image_pos_exemplars)
+        combined_pos_features = self.combine_features(features_pos_exemp)
+        bs = len(pos_exemplars)
+        num_pos_exemplars = pos_exemplars[0].shape[0]
+        if num_pos_exemplars > 0:
+            pos_exemplar_tokens = (
+                roi_align(
+                    combined_pos_features,
+                    boxes=pos_exemplars,
+                    output_size=(1, 1),
+                    spatial_scale=(1 / 8),
+                    aligned=True,
+                )
+                .squeeze(-1)
+                .squeeze(-1)
+                .reshape(bs, num_pos_exemplars, -1)
+            )
+        else:
+            pos_exemplar_tokens = None
+
+        # Negative exemplars
+        neg_exemplar_cache = []
+        num_neg_exemplar_imgs = len(input_images_neg_exemplars)
+        for ind in range(num_neg_exemplar_imgs):
+            exemplar_img = input_images_neg_exemplars[ind]
+            exemplars = neg_exemplars[ind]
+            neg_bs = len(exemplars)
+            if neg_bs == 0:
+                neg_exemplar_cache.append(None)
+                continue
+            num_neg_exemplars = exemplars[0].shape[0]
+            if exemplar_img is not None and num_neg_exemplars > 0:
+                features_neg_exemp, _ = self.backbone(exemplar_img)
+                combined_neg_features = self.combine_features(features_neg_exemp)
+                neg_tokens = (
+                    roi_align(
+                        combined_neg_features,
+                        boxes=exemplars,
+                        output_size=(1, 1),
+                        spatial_scale=(1 / 8),
+                        aligned=True,
+                    )
+                    .squeeze(-1)
+                    .squeeze(-1)
+                    .reshape(neg_bs, num_neg_exemplars, -1)
+                )
+                neg_exemplar_cache.append(neg_tokens)
+            else:
+                neg_exemplar_cache.append(None)
+
+        # Input projection
+        srcs = []
+        masks = []
+        for l, feat in enumerate(features):
+            src, mask = feat.decompose()
+            srcs.append(self.input_proj[l](src))
+            masks.append(mask)
+        if self.num_feature_levels > len(srcs):
+            _len_srcs = len(srcs)
+            for l in range(_len_srcs, self.num_feature_levels):
+                if l == _len_srcs:
+                    src = self.input_proj[l](features[-1].tensors)
+                else:
+                    src = self.input_proj[l](srcs[-1])
+                m = input_images.mask
+                mask = F.interpolate(m[None].float(), size=src.shape[-2:]).to(
+                    torch.bool
+                )[0]
+                pos_l = self.backbone[1](NestedTensor(src, mask)).to(src.dtype)
+                srcs.append(src)
+                masks.append(mask)
+                poss.append(pos_l)
+
+        return {
+            "srcs": srcs,
+            "masks": masks,
+            "poss": poss,
+            "input_images": input_images,
+            "pos_exemplar_tokens": pos_exemplar_tokens,
+            "neg_exemplar_cache": neg_exemplar_cache,
+        }
+
+    def forward_single_with_cache(self, backbone_cache, caption):
+        """Run text-dependent inference at batch_size=1 using cached backbone features.
+
+        Args:
+            backbone_cache: dict from compute_backbone_cache()
+            caption: single caption string (e.g. "wood processed . ")
+
+        Returns:
+            dict with pred_logits, pred_boxes, input_ids (batch_size=1)
+        """
+        srcs = backbone_cache["srcs"]
+        masks = backbone_cache["masks"]
+        poss = backbone_cache["poss"]
+        input_images = backbone_cache["input_images"]
+        pos_exemplar_tokens = backbone_cache["pos_exemplar_tokens"]
+        neg_exemplar_cache = backbone_cache["neg_exemplar_cache"]
+        device = input_images.device
+
+        # Tokenize single caption
+        tokenized = self.tokenizer([caption], padding="longest", return_tensors="pt").to(device)
+        one_hot_token = tokenized
+
+        (
+            text_self_attention_masks,
+            position_ids,
+            cate_to_token_mask_list,
+        ) = generate_masks_with_special_tokens_and_transfer_map(
+            tokenized, self.specical_tokens, self.tokenizer
+        )
+
+        if text_self_attention_masks.shape[1] > self.max_text_len:
+            text_self_attention_masks = text_self_attention_masks[
+                :, : self.max_text_len, : self.max_text_len
+            ]
+            position_ids = position_ids[:, : self.max_text_len]
+            tokenized["input_ids"] = tokenized["input_ids"][:, : self.max_text_len]
+            tokenized["attention_mask"] = tokenized["attention_mask"][
+                :, : self.max_text_len
+            ]
+            tokenized["token_type_ids"] = tokenized["token_type_ids"][
+                :, : self.max_text_len
+            ]
+
+        if self.sub_sentence_present:
+            tokenized_for_encoder = {
+                k: v for k, v in tokenized.items() if k != "attention_mask"
+            }
+            tokenized_for_encoder["attention_mask"] = text_self_attention_masks
+            tokenized_for_encoder["position_ids"] = position_ids
+        else:
+            tokenized_for_encoder = tokenized
+
+        bert_output = self.bert(**tokenized_for_encoder)
+
+        encoded_text = self.feat_map(bert_output["last_hidden_state"])
+        text_token_mask = tokenized.attention_mask.bool()
+
+        if encoded_text.shape[1] > self.max_text_len:
+            encoded_text = encoded_text[:, : self.max_text_len, :]
+            text_token_mask = text_token_mask[:, : self.max_text_len]
+            position_ids = position_ids[:, : self.max_text_len]
+            text_self_attention_masks = text_self_attention_masks[
+                :, : self.max_text_len, : self.max_text_len
+            ]
+
+        text_dict = {
+            "encoded_text": encoded_text,
+            "text_token_mask": text_token_mask,
+            "position_ids": position_ids,
+            "text_self_attention_masks": text_self_attention_masks,
+        }
+
+        # Add positive exemplar tokens from cache
+        if pos_exemplar_tokens is not None:
+            bs = pos_exemplar_tokens.shape[0]
+            exemplar_labels = [
+                torch.tensor([0]).to(device) for _ in range(bs)
+            ]
+            text_dict, tokenized = self.add_exemplar_tokens(
+                tokenized, text_dict, pos_exemplar_tokens, exemplar_labels
+            )
+
+        # Add negative exemplar tokens from cache
+        for ind, neg_tokens in enumerate(neg_exemplar_cache):
+            if neg_tokens is not None:
+                bs = neg_tokens.shape[0]
+                exemplar_labels = [
+                    torch.tensor([ind + 1]).to(device) for _ in range(bs)
+                ]
+                text_dict, tokenized = self.add_exemplar_tokens(
+                    tokenized, text_dict, neg_tokens, exemplar_labels
+                )
+
+        # Transformer
+        input_query_bbox = input_query_label = attn_mask = dn_meta = None
+        hs, reference, hs_enc, ref_enc, init_box_proposal = self.transformer(
+            srcs, masks, input_query_bbox, poss, input_query_label, attn_mask, text_dict
+        )
+
+        # Box predictions
+        outputs_coord_list = []
+        for dec_lid, (layer_ref_sig, layer_bbox_embed, layer_hs) in enumerate(
+            zip(reference[:-1], self.bbox_embed, hs)
+        ):
+            layer_delta_unsig = layer_bbox_embed(layer_hs)
+            layer_outputs_unsig = layer_delta_unsig + inverse_sigmoid(layer_ref_sig)
+            layer_outputs_unsig = layer_outputs_unsig.sigmoid()
+            outputs_coord_list.append(layer_outputs_unsig)
+        outputs_coord_list = torch.stack(outputs_coord_list)
+
+        # Classification
+        outputs_class = torch.stack(
+            [
+                layer_cls_embed(layer_hs, text_dict)
+                for layer_cls_embed, layer_hs in zip(self.class_embed, hs)
+            ]
+        )
+
+        out = {"pred_logits": outputs_class[-1], "pred_boxes": outputs_coord_list[-1]}
+        out["input_ids"] = tokenized["input_ids"]
+
+        return out
+
     def forward(
         self,
         input_images: NestedTensor,
