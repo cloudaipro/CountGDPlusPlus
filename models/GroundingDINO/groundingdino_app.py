@@ -42,6 +42,7 @@ from groundingdino.util.misc import (
     nested_tensor_from_tensor_list,
 )
 from groundingdino.util.utils import get_phrases_from_posmap
+from groundingdino.util.visualizer import COCOVisualizer
 from groundingdino.util.vl_utils import create_positive_map_from_span
 
 from ..registry import MODULE_BUILD_FUNCS
@@ -713,11 +714,8 @@ class GroundingDINO(nn.Module):
             pos_exemplar_tokens = None
 
         if pos_exemplar_tokens is not None:
-            exemplar_labels = [
-                torch.tensor([0]).to(input_images.device) for _ in range(bs)
-            ]
             text_dict, tokenized = self.add_exemplar_tokens(
-                tokenized, text_dict, pos_exemplar_tokens, exemplar_labels
+                tokenized, text_dict, pos_exemplar_tokens, [torch.tensor([0]).to(input_images.device)]
             )
 
         # Negative exemplars
@@ -725,10 +723,8 @@ class GroundingDINO(nn.Module):
         for ind in range(num_neg_exemplar_imgs):
             exemplar_img = input_images_neg_exemplars[ind]
             exemplars = neg_exemplars[ind]
-            bs = len(exemplars)
-            if bs == 0:
-                continue
-            num_neg_exemplars = exemplars[0].shape[0]  # list per batch sample
+            bs = 1
+            num_neg_exemplars = len(exemplars[0]) # Each set of exemplars has a batch dimension for compatibility with roialign
             if exemplar_img is not None and num_neg_exemplars > 0:
                 features_neg_exemp, _ = self.backbone(exemplar_img)
                 combined_neg_features = self.combine_features(features_neg_exemp)
@@ -745,11 +741,8 @@ class GroundingDINO(nn.Module):
                     .squeeze(-1)
                     .reshape(bs, num_neg_exemplars, -1)
                 )
-                exemplar_labels = [
-                    torch.tensor([ind + 1]).to(input_images.device) for _ in range(bs)
-                ]
                 text_dict, tokenized = self.add_exemplar_tokens(
-                    tokenized, text_dict, neg_exemplar_tokens, exemplar_labels
+                    tokenized, text_dict, neg_exemplar_tokens, [torch.tensor([ind + 1]).to(input_images.device)]
                 )
 
         srcs = []
@@ -1485,3 +1478,4 @@ def create_positive_map_exemplar(input_ids, label, special_tokens):
                 ind_to_insert_ones += 1
             break
     return tokens_positive
+

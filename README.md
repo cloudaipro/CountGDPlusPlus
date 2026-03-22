@@ -1,7 +1,7 @@
-# CountGD++: Generalized Prompting for Open-World Counting
+# [CVPR 2026] CountGD++: Generalized Prompting for Open-World Counting
 Niki Amini-Naieni & Andrew Zisserman
 
-## [NOTE]: Code and models will be released within the next few days
+## [NOTE]: Full training and inference code will be released by June 3rd, 2026 (CVPR 2026 conference start date)
 
 Official PyTorch implementation for CountGD++. Details can be found in the paper, [[Paper]](https://arxiv.org/abs/2512.23351) [[Project page]](https://github.com/niki-amini-naieni/CountGDPlusPlus/).
 
@@ -196,11 +196,11 @@ Download FSCD-147 from [here](https://drive.google.com/file/d/1m_v_hBwXH1NzcuUj_
 ## Citation
 Please cite our related papers if you build off of our work.
 ```
-@article{AminiNaieni25,
+@InProceedings{AminiNaieni26,
   title={CountGD++: Generalized Prompting for Open-World Counting},
   author={Amini-Naieni, N. and Zisserman, A.},
-  journal={arXiv preprint arXiv:2512.23351},
-  year={2025}
+  booktitle = {Proceedings of the IEEE Conference on Computer Vision and Pattern Recognition (CVPR)},
+  year={2026}
 }
 
 @InProceedings{AminiNaieni24,
