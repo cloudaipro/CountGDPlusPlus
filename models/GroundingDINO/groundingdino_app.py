@@ -467,6 +467,93 @@ class GroundingDINO(nn.Module):
             "neg_exemplar_cache": neg_exemplar_cache,
         }
 
+    def compute_image_backbone(self, input_images: NestedTensor):
+        """Compute image backbone features, input projections, and combined features.
+
+        This is the most expensive part of inference. The result can be reused
+        across multiple calls with different text prompts or exemplar boxes.
+
+        Returns a dict with: srcs, masks, poss, input_images, combined_features.
+        """
+        if isinstance(input_images, (list, torch.Tensor)):
+            input_images = nested_tensor_from_tensor_list(input_images)
+
+        features, poss = self.backbone(input_images)
+        combined_features = self.combine_features(features)
+
+        # Input projection
+        srcs = []
+        masks = []
+        for l, feat in enumerate(features):
+            src, mask = feat.decompose()
+            srcs.append(self.input_proj[l](src))
+            masks.append(mask)
+        if self.num_feature_levels > len(srcs):
+            _len_srcs = len(srcs)
+            for l in range(_len_srcs, self.num_feature_levels):
+                if l == _len_srcs:
+                    src = self.input_proj[l](features[-1].tensors)
+                else:
+                    src = self.input_proj[l](srcs[-1])
+                m = input_images.mask
+                mask = F.interpolate(m[None].float(), size=src.shape[-2:]).to(
+                    torch.bool
+                )[0]
+                pos_l = self.backbone[1](NestedTensor(src, mask)).to(src.dtype)
+                srcs.append(src)
+                masks.append(mask)
+                poss.append(pos_l)
+
+        return {
+            "srcs": srcs,
+            "masks": masks,
+            "poss": poss,
+            "input_images": input_images,
+            "combined_features": combined_features,
+        }
+
+    def compute_exemplar_tokens(self, combined_features, exemplar_boxes):
+        """Compute ROI-aligned exemplar tokens from pre-computed combined features.
+
+        Args:
+            combined_features: from compute_image_backbone()["combined_features"]
+            exemplar_boxes: list of box tensors (batch_size=1 list with shape [N, 4])
+
+        Returns:
+            Exemplar tokens tensor of shape [bs, N, C], or None if no boxes.
+        """
+        bs = len(exemplar_boxes)
+        num_exemplars = exemplar_boxes[0].shape[0]
+        if num_exemplars > 0:
+            return (
+                roi_align(
+                    combined_features,
+                    boxes=exemplar_boxes,
+                    output_size=(1, 1),
+                    spatial_scale=(1 / 8),
+                    aligned=True,
+                )
+                .squeeze(-1)
+                .squeeze(-1)
+                .reshape(bs, num_exemplars, -1)
+            )
+        return None
+
+    def assemble_backbone_cache(self, image_backbone, pos_exemplar_tokens, neg_exemplar_cache):
+        """Assemble a backbone cache dict from pre-computed parts.
+
+        Combines an image backbone (from compute_image_backbone) with exemplar
+        tokens into the format expected by forward_single_with_cache().
+        """
+        return {
+            "srcs": image_backbone["srcs"],
+            "masks": image_backbone["masks"],
+            "poss": image_backbone["poss"],
+            "input_images": image_backbone["input_images"],
+            "pos_exemplar_tokens": pos_exemplar_tokens,
+            "neg_exemplar_cache": neg_exemplar_cache,
+        }
+
     def forward_single_with_cache(self, backbone_cache, caption):
         """Run text-dependent inference at batch_size=1 using cached backbone features.
 
